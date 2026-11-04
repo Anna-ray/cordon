@@ -1,0 +1,26 @@
+<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Cordon</title>
+<style>:root{--bg:#fff;--fg:#111;--mut:#667;--ok:#0a7d3b;--bad:#c0262d;--warn:#b26a00;--card:#f4f5f8}
+@media(prefers-color-scheme:dark){:root{--bg:#0e1116;--fg:#e8eaed;--mut:#9aa;--card:#181c24}}
+body{background:var(--bg);color:var(--fg);font:15px system-ui,sans-serif;max-width:920px;margin:2rem auto;padding:0 1rem}
+button,select{font:inherit;padding:.45rem .8rem}.card{background:var(--card);border-radius:10px;padding:1rem;margin:.8rem 0;overflow-x:auto}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.mut{color:var(--mut)}table{border-collapse:collapse;width:100%}td,th{padding:.35rem;text-align:left;border-bottom:1px solid #8883}
+pre{white-space:pre-wrap;font-size:12px}</style>
+<h1>Cordon</h1><p class=mut>Counterparty due diligence. Contained agents. Verified evidence. Every claim carries a warrant: code that actually ran in an isolated sandbox.</p>
+<div id=mode class=mut></div>
+<select id=c></select> <button onclick=run()>Investigate</button> <button onclick=cont()>Run containment red-team</button>
+<div id=out></div>
+<script>
+const $=id=>document.getElementById(id),j=(u,m)=>fetch(u,{method:m||'GET'}).then(r=>r.json());
+const esc=s=>String(s??'').replace(/[&<>]/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[x]));
+j('/api/health').then(h=>$('mode').innerHTML='Sandbox: <b class='+(h.sandbox=='docker'?'ok':'bad')+'>'+esc(h.sandbox)+'</b>');
+j('/api/cases').then(a=>$('c').innerHTML=a.map(x=>`<option value=${x.id}>${esc(x.name)}</option>`).join(''));
+async function run(){$('out').innerHTML='<p class=mut>Investigating...</p>';const r=await j('/api/investigate/'+$('c').value,'POST');
+const col={CLEAR:'ok',ESCALATE:'warn',REJECT:'bad'}[r.verdict];
+$('out').innerHTML=`<div class=card><h2 class=${col}>${r.verdict}</h2>Evidence coverage: ${r.evidence_coverage}<ol>${r.trace.map(t=>`<li><b>${esc(t.agent)}</b>: ${esc(t.step)}</li>`).join('')}</ol><details><summary class=mut>orchestrator decisions</summary><ol>${r.orchestration.map(o=>`<li>${esc(o.action)} ${esc((o.targets||[]).join(','))}: ${esc(o.why)}</li>`).join('')}</ol></details>
+${r.events.map(e=>`<p class=bad>Injection detected in ${esc(e.doc)}. Treated as data; sandbox has no network or secrets.</p>`).join('')}</div>
+<div class=card><h3>Evidence ledger</h3><table><tr><th>Claim<th>Observed<th>Result<th>Sandbox</tr>${r.ledger.map(x=>`<tr><td>${esc(x.claim)}${x.origin?' <i class=mut>(challenger)</i>':''}${x.anchored===false?' <i class=bad>(no source quote found)</i>':''}<td>${esc(x.observed)}<td class=${x.passed?'ok':x.passed===false?'bad':'warn'}>${x.passed?'PASS':x.passed===false?'FAIL':'UNVERIFIED'}<td class=mut>${esc(x.sandbox)} x${x.attempts}<tr><td colspan=4><details><summary class=mut>executed code</summary><pre>${esc(x.code)}</pre></details></tr>`).join('')}</table></div>
+${r.action?`<div class=card><b>Proposed action:</b> ${esc(r.action.summary)}<br><button onclick="ap('${r.run_id}')">Approve and execute</button> <span id=ac class=mut>${r.action.status}</span></div>`:''}`}
+async function ap(id){const a=await j('/api/approve/'+id,'POST');$('ac').textContent=a.status}
+async function cont(){$('out').innerHTML='<p class=mut>Running attacks...</p>';const r=await j('/api/containment');
+$('out').innerHTML=`<div class=card><h3>Containment red-team</h3><table><tr><th>Attack<th>Result<th>Evidence</tr>${r.map(x=>`<tr><td>${x.attack}<td class=${x.contained?'ok':'bad'}>${x.contained?'CONTAINED':'BREACH'}<td class=mut>${esc(x.evidence)}</tr>`).join('')}</table><p class=mut>Mode: ${esc(r[0].mode)}</p></div>`}
+</script>
