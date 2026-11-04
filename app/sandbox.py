@@ -1,59 +1,183 @@
-"""Contained execution. Docker mode: no network, read-only FS, no secrets, caps dropped,
-mem/cpu/pid/time limits, container destroyed after every run."""
-import json, os, resource, shutil, subprocess, tempfile, time
+
+"""Fail-closed execution of untrusted Python code in Docker."""
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+import uuid
 
 IMAGE = os.getenv("SANDBOX_IMAGE", "python:3.12-slim")
+MAX_CODE_BYTES = 64 * 1024
+MAX_DATA_BYTES = 1024 * 1024
+
 
 def docker_ok():
-    try:
-        return subprocess.run(["docker", "info"], capture_output=True, timeout=5).returncode == 0
-    except Exception:
+    """Check whether the Docker daemon is reachable."""
+    docker = shutil.which("docker")
+    if not docker:
         return False
 
-def _limits():
-    resource.setrlimit(resource.RLIMIT_AS, (512 << 20,) * 2)
-    resource.setrlimit(resource.RLIMIT_CPU, (10, 10))
+    try:
+        result = subprocess.run(
+            [docker, "info"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _image_available(docker):
+    """Require a pre-pulled image; never pull an image during execution."""
+    try:
+        result = subprocess.run(
+            [docker, "image", "inspect", IMAGE],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _unavailable(reason):
+    return {
+        "ok": False,
+        "stdout": "",
+        "stderr": reason,
+        "exit": -1,
+        "killed": False,
+        "ms": 0,
+        "mode": "UNAVAILABLE",
+    }
+
 
 def run(code, data=None, timeout=10):
-    d = tempfile.mkdtemp(prefix="vsb_"); os.chmod(d, 0o755)
-    for fn, body in (("check.py", code), ("data.json", json.dumps(data or {}))):
-        open(f"{d}/{fn}", "w").write(body); os.chmod(f"{d}/{fn}", 0o644)
-    name = "vsb-" + os.urandom(4).hex()
-    if docker_ok():
-        mode, kw = "docker", {}
-        cmd = ["docker", "run", "--rm", "--name", name, "--network", "none", "--read-only",
-               "--tmpfs", "/tmp:size=16m", "--memory", "128m", "--memory-swap", "128m",
-               "--cpus", "0.5", "--pids-limit", "64", "--cap-drop", "ALL",
-               "--security-opt", "no-new-privileges", "--user", "65534:65534",
-               "-v", f"{d}:/work:ro", "-w", "/work", IMAGE, "python", "check.py"]
-    else:
-        mode, kw = "DEGRADED-local (no Docker: NOT isolated)", dict(cwd=d, env={}, preexec_fn=_limits)
-        cmd = ["python3", "check.py"]
-    t0, killed = time.time(), False
+    """Execute code only inside a restricted Docker container.
+
+    Docker unavailable, image missing, or invalid input:
+    refuse execution. There is deliberately no local fallback.
+    """
+    if not isinstance(code, str):
+        return _unavailable("Rejected: code must be a string.")
+
+    if len(code.encode("utf-8")) > MAX_CODE_BYTES:
+        return _unavailable("Rejected: code exceeds size limit.")
+
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kw)
-        out, err, rc = p.stdout[-4000:], p.stderr[-4000:], p.returncode
-    except subprocess.TimeoutExpired:
-        killed, out, err, rc = True, "", "killed: timeout", -9
-        if mode == "docker":
-            subprocess.run(["docker", "kill", name], capture_output=True)
-    shutil.rmtree(d, ignore_errors=True)
-    return {"ok": rc == 0, "stdout": out, "stderr": err, "exit": rc, "killed": killed,
-            "ms": int((time.time() - t0) * 1000), "mode": mode}
+        serialized = json.dumps(data if data is not None else {})
+    except (TypeError, ValueError):
+        return _unavailable("Rejected: input data is not JSON serializable.")
 
-PAYLOADS = {
- "read_secrets": "import os\nl=[k for k in os.environ if any(s in k.upper() for s in ('KEY','TOKEN','SECRET'))]\nprint('BREACH' if l else 'BLOCKED: no secrets inside sandbox')",
- "network_exfil": "import socket\ntry:\n    socket.create_connection(('1.1.1.1',80),2);print('BREACH')\nexcept Exception as e:\n    print('BLOCKED:',type(e).__name__)",
- "write_outside": "try:\n    open('/etc/pwned','w').write('x');print('BREACH')\nexcept Exception as e:\n    print('BLOCKED:',type(e).__name__)",
- "memory_bomb": "x=bytearray(1<<30);print('BREACH')",
- "fork_bomb": "import os,time\nn=0\ntry:\n    for _ in range(120):\n        if os.fork()==0:\n            time.sleep(4);os._exit(0)\n        n+=1\n    print('BREACH')\nexcept Exception:\n    print('BLOCKED after',n,'forks')",
- "infinite_loop": "while True: pass",
-}
+    if len(serialized.encode("utf-8")) > MAX_DATA_BYTES:
+        return _unavailable("Rejected: input data exceeds size limit.")
 
-def containment_suite():
-    rows = []
-    for k, c in PAYLOADS.items():
-        r = run(c, timeout=6)
-        rows.append({"attack": k, "contained": "BREACH" not in r["stdout"], "killed": r["killed"],
-                     "exit": r["exit"], "evidence": (r["stdout"].strip() or r["stderr"].strip())[-120:], "mode": r["mode"]})
-    return rows
+    docker = shutil.which("docker")
+    if not docker or not docker_ok():
+        return _unavailable(
+            "Docker daemon unavailable. Refusing unisolated execution."
+        )
+
+    if not _image_available(docker):
+        return _unavailable(
+            f"Sandbox image {IMAGE!r} is not available locally. "
+            "Pull and verify it before running Cordon."
+        )
+
+    timeout = max(1, min(int(timeout), 30))
+    directory = tempfile.mkdtemp(prefix="cordon_sandbox_")
+    name = "cordon-" + uuid.uuid4().hex[:12]
+    started = time.time()
+    killed = False
+    launched = False
+
+    try:
+        code_path = os.path.join(directory, "check.py")
+        data_path = os.path.join(directory, "data.json")
+
+        with open(code_path, "w", encoding="utf-8") as f:
+            f.write(code)
+
+        with open(data_path, "w", encoding="utf-8") as f:
+            f.write(serialized)
+
+        for path in (code_path, data_path):
+            try:
+                os.chmod(path, 0o644)
+            except OSError:
+                pass
+
+        command = [
+            docker, "run",
+            "--rm",
+            "--pull=never",
+            "--name", name,
+            "--network=none",
+            "--read-only",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=16m",
+            "--memory=128m",
+            "--memory-swap=128m",
+            "--cpus=0.5",
+            "--pids-limit=64",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges:true",
+            "--user=65534:65534",
+            "--mount", f"type=bind,source={directory},target=/work,readonly",
+            "--workdir=/work",
+            IMAGE,
+            "python", "check.py",
+        ]
+
+        launched = True
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            stdout = (result.stdout or "")[-4000:]
+            stderr = (result.stderr or "")[-4000:]
+            exit_code = result.returncode
+
+        except subprocess.TimeoutExpired:
+            killed = True
+            stdout = ""
+            stderr = "Execution killed: timeout exceeded."
+            exit_code = -9
+
+        return {
+            "ok": exit_code == 0 and not killed,
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit": exit_code,
+            "killed": killed,
+            "ms": int((time.time() - started) * 1000),
+            "mode": "docker",
+        }
+
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            **_unavailable(f"Docker execution failed: {type(exc).__name__}: {exc}"),
+            "ms": int((time.time() - started) * 1000),
+        }
+
+    finally:
+        if launched:
+            try:
+                subprocess.run(
+                    [docker, "rm", "-f", name],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+        shutil.rmtree(directory, ignore_errors=True)
