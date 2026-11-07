@@ -134,7 +134,7 @@ def init_db():
                 (json.dumps(payload), stale["id"]),
             )
             con.execute(
-                """UPDATE assessments SET status='investigation_failed'
+                """UPDATE assessments SET status='investigation_failed'$.run_status'
                    WHERE id=? AND status='investigating'""",
                 (stale["assessment_id"],),
             )
@@ -431,7 +431,7 @@ def _investigation_worker(run_id, assessment_id, assessment, files):
     try:
         with db() as con:
             con.execute(
-                "UPDATE assessment_runs SET status=? WHERE id=?",
+                "UPDATE assessment_runs SET status=?, result_json=json_set(result_json, '$.run_status', 'running', '$.status', 'INVESTIGATION_RUNNING') WHERE id=?",
                 ("running", run_id),
             )
             con.execute(
@@ -622,7 +622,7 @@ def investigate_assessment(assessment_id: str):
                         ),
                     )
                     con.execute(
-                        """UPDATE assessments SET status='investigation_failed'
+                        """UPDATE assessments SET status='investigation_failed'$.run_status'
                            WHERE id=? AND status='investigating'""",
                         (assessment_id,),
                     )

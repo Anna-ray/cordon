@@ -123,6 +123,7 @@ function navigate(view){
   document.querySelectorAll('.section').forEach(x=>x.classList.toggle('active',x.id===view));
   document.querySelectorAll('[data-view]').forEach(x=>x.classList.toggle('active',x.dataset.view===view));
   $('pageTitle').textContent=({overview:'Overview',new:'New assessment',assessments:'Assessments',detail:'Assessment detail'})[view]||'Cordon';
+  if(view!=='detail'){detailEpoch++;clearTimeout(pollTimer)}
   if(view!=='new' && view!=='detail') refresh();
 }
 document.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>navigate(b.dataset.view)));
@@ -136,6 +137,7 @@ async function refresh(){try{assessments=await api('/api/assessments');const fil
 
 let currentAssessmentId=null;
 let detailEpoch=0;
+let pollStart=0,pollFails=0;
 let pollTimer=null;
 let currentInvestigation=null;
 
@@ -235,6 +237,7 @@ async function openAssessment(id){
   detailEpoch++;
   clearTimeout(pollTimer);
   currentAssessmentId=id;
+  pollStart=Date.now();pollFails=0;
   currentInvestigation=null;
   navigate('detail');
   $('detailCompany').textContent='Loading assessment…';
@@ -259,6 +262,7 @@ async function startInvestigation(){
     const assessment=await api(`/api/assessments/${encodeURIComponent(currentAssessmentId)}`);
     renderDetail(assessment,result);
     toast('Investigation queued.');
+    pollStart=Date.now();pollFails=0;
     pollInvestigation(detailEpoch);
   }catch(e){
     if(btn){btn.disabled=false;btn.textContent='Retry investigation'}
@@ -268,9 +272,11 @@ async function startInvestigation(){
 async function pollInvestigation(epoch){
   clearTimeout(pollTimer);
   if(epoch!==detailEpoch||!currentAssessmentId)return;
+  if(Date.now()-pollStart>600000){toast('Still running after 10 minutes. Reopen the assessment to check again.');return}
   try{
     const result=await api(`/api/assessments/${encodeURIComponent(currentAssessmentId)}/investigation`);
     if(epoch!==detailEpoch)return;
+    pollFails=0;
     currentInvestigation=result;
     const assessment=await api(`/api/assessments/${encodeURIComponent(currentAssessmentId)}`);
     if(epoch!==detailEpoch)return;
@@ -282,7 +288,7 @@ async function pollInvestigation(epoch){
       refresh();
     }
   }catch(e){
-    if(epoch===detailEpoch){
+    if(epoch===detailEpoch&&++pollFails<=5){
       pollTimer=setTimeout(()=>pollInvestigation(epoch),6000);
     }
   }
