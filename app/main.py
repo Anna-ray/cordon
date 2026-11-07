@@ -9,7 +9,7 @@ import zipfile
 import io
 from concurrent.futures import ThreadPoolExecutor
 import threading
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.staticfiles import StaticFiles
@@ -58,6 +58,17 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
+
+        # Add reporting-period columns to existing assessment databases.
+        columns = {
+            row["name"]
+            for row in con.execute("PRAGMA table_info(assessments)")
+        }
+        if "scope_start" not in columns:
+            con.execute("ALTER TABLE assessments ADD COLUMN scope_start TEXT")
+        if "scope_end" not in columns:
+            con.execute("ALTER TABLE assessments ADD COLUMN scope_end TEXT")
+
         con.execute("""
             CREATE TABLE IF NOT EXISTS assessment_files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -169,6 +180,8 @@ def assessment_payload(row):
         "company": row["company"],
         "objective": row["objective"],
         "context": row["context"],
+        "scope_start": row["scope_start"],
+        "scope_end": row["scope_end"],
         "status": row["status"],
         "created_at": row["created_at"],
         "files": files,
@@ -255,11 +268,35 @@ async def create_assessment(
     company: str = Form(...),
     objective: str = Form(""),
     context: str = Form(""),
+    scope_start: str = Form(""),
+    scope_end: str = Form(""),
     files: list[UploadFile] = File(default=[]),
 ):
     company = company.strip()
     objective = objective.strip()
     context = context.strip()
+    scope_start = scope_start.strip() or None
+    scope_end = scope_end.strip() or None
+
+    if bool(scope_start) != bool(scope_end):
+        raise HTTPException(
+            422,
+            "Provide both reporting-period start and end dates, or leave both blank",
+        )
+
+    if scope_start and scope_end:
+        try:
+            parsed_start = date.fromisoformat(scope_start)
+            parsed_end = date.fromisoformat(scope_end)
+        except ValueError:
+            raise HTTPException(422, "Reporting-period dates must use YYYY-MM-DD")
+
+        if parsed_start.isoformat() != scope_start or parsed_end.isoformat() != scope_end:
+            raise HTTPException(422, "Reporting-period dates must use YYYY-MM-DD")
+
+        if parsed_start > parsed_end:
+            raise HTTPException(422, "Reporting-period start must not be after its end")
+
     if not company or len(company) > 180:
         raise HTTPException(422, "Company name is required and must be at most 180 characters")
     if len(objective) > 4000 or len(context) > 12000:
@@ -328,8 +365,13 @@ async def create_assessment(
         # Persist assessment, file records and extraction records atomically.
         with db() as con:
             con.execute(
-                "INSERT INTO assessments(id, company, objective, context, status, created_at) VALUES(?,?,?,?,?,?)",
-                (aid, company, objective, context, "received", now),
+                """INSERT INTO assessments
+                   (id, company, objective, context, scope_start, scope_end, status, created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    aid, company, objective, context,
+                    scope_start, scope_end, "received", now,
+                ),
             )
             for item, extraction in zip(saved, extraction_results):
                 display_name, stored, media_type, size_bytes = item

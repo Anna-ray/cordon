@@ -272,7 +272,11 @@ def investigate_evidence(assessment, files, chat=None):
     if has_availability_csv:
         try:
             assay_checks.append(
-                verify_availability_in_sandbox(sources)
+                verify_availability_in_sandbox(
+                    sources,
+                    scope_start=assessment.get("scope_start"),
+                    scope_end=assessment.get("scope_end"),
+                )
             )
         except AssayError as exc:
             assay_checks.append({
@@ -294,6 +298,11 @@ def investigate_evidence(assessment, files, chat=None):
         == "SANDBOX_EXECUTION_PASSED_AND_RECOMPUTED"
         for check in assay_checks
     )
+    observed_window_only = any(
+        check.get("verification_status")
+        == "SANDBOX_RECOMPUTED_OBSERVED_WINDOW_ONLY"
+        for check in assay_checks
+    )
     insufficient = any(
         check.get("status") == "INSUFFICIENT_EVIDENCE"
         for check in assay_checks
@@ -311,6 +320,12 @@ def investigate_evidence(assessment, files, chat=None):
         assay_agent_output = (
             "Availability calculation recomputed successfully in Docker; "
             "source-data authenticity remains unverified"
+        )
+    elif observed_window_only:
+        assay_agent_status = "limited"
+        assay_agent_output = (
+            "Availability was recomputed in Docker only for the supplied "
+            "observation window; complete reporting-period coverage was not established"
         )
     elif insufficient:
         assay_agent_status = "insufficient_evidence"
@@ -355,6 +370,11 @@ def investigate_evidence(assessment, files, chat=None):
             "sandbox_recomputed_checks": sum(
                 check.get("verification_status")
                 == "SANDBOX_EXECUTION_PASSED_AND_RECOMPUTED"
+                for check in assay_checks
+            ),
+            "observed_window_only_checks": sum(
+                check.get("verification_status")
+                == "SANDBOX_RECOMPUTED_OBSERVED_WINDOW_ONLY"
                 for check in assay_checks
             ),
         },
