@@ -112,6 +112,9 @@ def run(code, data=None, timeout=10):
             except OSError:
                 pass
 
+        # The container runs as UID 65534 and must traverse the bind-mounted directory.
+        os.chmod(directory, 0o755)
+
         command = [
             docker, "run",
             "--rm",

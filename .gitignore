@@ -22,3 +22,4 @@ audit.jsonl
 .idea/
 .DS_Store
 Thumbs.db
+data/
